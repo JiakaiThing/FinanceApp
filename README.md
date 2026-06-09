@@ -17,7 +17,7 @@ A local Windows desktop app for tracking monthly expenses and income across one 
 Requires Python 3.9+.
 
 ```powershell
-cd "<path to>\FinanceApp"
+cd "<path to>\FinanceApp_Python"
 pip install -r requirements.txt
 python main.py
 ```
@@ -96,13 +96,13 @@ A table lists every unassigned merchant. For each one you choose:
 | Column | What it does |
 |---|---|
 | **Type** | `Expense`, `Income`, `Investment`, `Discrepancy`, or `Transfer`. Drives the sign rules exactly like a normal category (see *How values & signs work*). |
-| **Final category name** | The real category the merchant should fold into, e.g. `Groceries`, `Eating Out`. |
+| **Final category name** | A dropdown of your existing and saved category names — pick one to fold the merchant into it. Choose **Other (type a new name)** at the top of the list to switch the box to free text and create a brand-new category (use the ▾ button to switch back to the dropdown). |
 | **Mapping** | `Per-Project` (remembered only in this project) or `Global` (remembered across all projects). |
 
 - **Merging:** several merchants given the **same name + type** merge into a single column, with their values summed — exactly like the manual grid.
 - **Transfer type:** money moved between your own accounts. Assigning a merchant to **Transfer** removes its column from the grid entirely (it's neither income nor expense). Transfer-style rows keep their *full* description as the temporary name (not shortened) so you can tell which transfer is which.
 - **Remembered rules:** once assigned, the same merchant in a future CSV auto-assigns straight to its final category — no temporary step. `Global` rules apply in every project; `Per-Project` rules only in the project you saved them in.
-- **Managing saved rules:** click **Manage mappings…** (top-right of the Add Entry box) to see every saved merchant rule. You can edit each rule's **Type**, **Final category** name, and **Mapping** scope inline, then click **Save** (switching a rule to *Per-Project* applies it to the project you're viewing). Or click **Delete** on a row to forget it — that merchant will become a temporary category again on the next import. Editing or deleting a rule does **not** touch amounts already imported into your categories.
+- **Managing saved rules:** click **Manage mappings…** (top-right of the Add Entry box) to see every saved merchant rule. You can edit each rule's **Type**, **Final category** (the same dropdown of existing names, with **Other** to type a new one), and **Mapping** scope inline, then click **Save** (switching a rule to *Per-Project* applies it to the project you're viewing). Or click **Delete** on a row to forget it — that merchant will become a temporary category again on the next import. Editing or deleting a rule does **not** touch amounts already imported into your categories.
 - **Partial saves:** click **Save** and any fully-filled rows are assigned immediately. The window closes either way. Rows missing a Type, Mapping, or name stay temporary, and your in-progress selections are saved as a draft so they're restored when you reopen the window via **Assign now**.
 
 > **Tip:** Right-click a light-red temporary column header in the grid to jump straight to **Assign now**, or to delete that merchant column outright.

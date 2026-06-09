@@ -1628,6 +1628,9 @@ class MainWindow(ttk.Frame):
     # group, so "no selection" uses a sentinel that no radio value uses.
     _ASSIGN_TYPE_UNSET = "__type_unset__"
     _ASSIGN_SCOPE_UNSET = "__scope_unset__"
+    # Final-category dropdown sentinel: picking this swaps the box to a
+    # free-text entry for a brand-new category name.
+    _ASSIGN_OTHER = "Other (type a new name)"
 
     def _assign_type_options(self) -> list[tuple[str, int]]:
         return [
@@ -1679,8 +1682,8 @@ class MainWindow(ttk.Frame):
         # Sized so the whole table (name + 5 type radios + name entry + 2
         # mapping radios + separators + scrollbar) fits without horizontal
         # scrolling, even at the minimum size.
-        win.geometry("1160x600")
-        win.minsize(1100, 380)
+        win.geometry("1185x600")
+        win.minsize(1175, 380)
         self._assign_win = win
 
         header = ttk.Label(
@@ -1746,8 +1749,11 @@ class MainWindow(ttk.Frame):
         # is widest so long "Transfer ..." descriptions wrap.
         root.columnconfigure(self._ASSIGN_COL_NAME, minsize=250)
         root.columnconfigure(self._ASSIGN_COL_TYPE, minsize=420)
-        root.columnconfigure(self._ASSIGN_COL_FINAL, minsize=160)
+        root.columnconfigure(self._ASSIGN_COL_FINAL, minsize=220)
         root.columnconfigure(self._ASSIGN_COL_MAPPING, minsize=200)
+
+        # Existing/saved category names to offer in each row's dropdown.
+        suggestions = self._repo.suggested_category_names(project.id)
 
         # Header row.
         for col, txt in (
@@ -1761,7 +1767,7 @@ class MainWindow(ttk.Frame):
             )
 
         for idx, (key, display) in enumerate(merchants):
-            self._build_assign_row(idx + 1, key, display)
+            self._build_assign_row(idx + 1, key, display, suggestions)
 
         # Vertical separators between sections, spanning header + all rows.
         total_rows = len(merchants) + 1
@@ -1774,7 +1780,9 @@ class MainWindow(ttk.Frame):
                 row=0, column=sep_col, rowspan=total_rows, sticky="ns", padx=4
             )
 
-    def _build_assign_row(self, grid_row: int, key: str, display: str) -> None:
+    def _build_assign_row(
+        self, grid_row: int, key: str, display: str, suggestions: list
+    ) -> None:
         project = self._state.selected_project
         draft = self._repo.get_merchant_draft(project.id, key) if project else None
         draft_kind = draft[0] if draft else None
@@ -1801,9 +1809,58 @@ class MainWindow(ttk.Frame):
                 type_frame, text=label, value=label, variable=type_var
             ).pack(side=tk.LEFT)
 
-        name_var = tk.StringVar(value=draft_name or "")
-        name_entry = tk.Entry(root, textvariable=name_var, width=18, justify="center")
-        name_entry.grid(row=grid_row, column=self._ASSIGN_COL_FINAL, sticky="w", padx=(4, 8), pady=3)
+        # Final category: a dropdown of saved/existing names, with "Other" at
+        # the top to swap in a free-text entry for a brand-new name.
+        final_frame = tk.Frame(root)
+        final_frame.grid(row=grid_row, column=self._ASSIGN_COL_FINAL, sticky="ew", padx=(4, 8), pady=3)
+        final_frame.columnconfigure(0, weight=1)
+        combo_var = tk.StringVar()
+        name_var = tk.StringVar()
+        mode_var = tk.StringVar(value="list")
+
+        combo = ttk.Combobox(
+            final_frame,
+            textvariable=combo_var,
+            values=[self._ASSIGN_OTHER] + list(suggestions),
+            state="readonly",
+            justify="center",
+        )
+        entry_wrap = tk.Frame(final_frame)
+        entry_wrap.columnconfigure(0, weight=1)
+        entry = tk.Entry(entry_wrap, textvariable=name_var, justify="center")
+        entry.grid(row=0, column=0, sticky="ew")
+
+        def show_list() -> None:
+            mode_var.set("list")
+            entry_wrap.grid_remove()
+            combo.grid(row=0, column=0, sticky="ew")
+            combo_var.set("")
+
+        def show_other(focus: bool = True) -> None:
+            mode_var.set("other")
+            combo.grid_remove()
+            entry_wrap.grid(row=0, column=0, sticky="ew")
+            if focus:
+                entry.focus_set()
+
+        # Small button to return from the free-text entry to the dropdown.
+        ttk.Button(entry_wrap, text="\u25be", width=2, command=show_list).grid(
+            row=0, column=1, sticky="w", padx=(2, 0)
+        )
+
+        def _on_combo(_e=None) -> None:
+            if combo_var.get() == self._ASSIGN_OTHER:
+                show_other()
+
+        combo.bind("<<ComboboxSelected>>", _on_combo, add=True)
+
+        combo.grid(row=0, column=0, sticky="ew")
+        if draft_name:
+            if draft_name in suggestions:
+                combo_var.set(draft_name)
+            else:
+                name_var.set(draft_name)
+                show_other(focus=False)
 
         if draft_scope == "global":
             scope_default = "Global"
@@ -1825,9 +1882,10 @@ class MainWindow(ttk.Frame):
                 "display": display,
                 "name_lbl": name_lbl,
                 "type_var": type_var,
-                "name_var": name_var,
+                "final_combo_var": combo_var,
+                "final_name_var": name_var,
+                "final_mode_var": mode_var,
                 "scope_var": scope_var,
-                "name_entry": name_entry,
             }
         )
 
@@ -1840,6 +1898,16 @@ class MainWindow(ttk.Frame):
             return "project"
         return None
 
+    def _assign_final_name(self, w: dict) -> str:
+        """The chosen final category name for a row: the typed text in 'Other'
+        mode, otherwise the dropdown selection (empty if nothing picked)."""
+        if w["final_mode_var"].get() == "other":
+            return w["final_name_var"].get().strip()
+        value = w["final_combo_var"].get()
+        if not value or value == self._ASSIGN_OTHER:
+            return ""
+        return value.strip()
+
     def _row_is_complete(self, w: dict) -> bool:
         type_label = w["type_var"].get()
         if not type_label or type_label == self._ASSIGN_TYPE_UNSET:
@@ -1850,7 +1918,7 @@ class MainWindow(ttk.Frame):
         # Transfer drops the column, so a final name isn't required.
         if type_label == "Transfer":
             return True
-        return bool(w["name_var"].get().strip())
+        return bool(self._assign_final_name(w))
 
     def _persist_assign_drafts(self) -> None:
         """Save every row's current selection as a draft (so reopening the
@@ -1861,7 +1929,7 @@ class MainWindow(ttk.Frame):
         for w in self._assign_row_widgets:
             type_label = w["type_var"].get()
             kind = self._type_label_to_kind(type_label) if type_label else None
-            name = w["name_var"].get().strip() or None
+            name = self._assign_final_name(w) or None
             scope = self._assign_scope_value(w["scope_var"].get())
             # Only keep a draft with real progress (a Type or name); a
             # scope-only selection isn't worth restoring.
@@ -1879,7 +1947,7 @@ class MainWindow(ttk.Frame):
         assigned = 0
         for w in self._assign_row_widgets:
             type_label = w["type_var"].get()
-            name = w["name_var"].get().strip()
+            name = self._assign_final_name(w)
             scope = self._assign_scope_value(w["scope_var"].get())
             kind = self._type_label_to_kind(type_label) if type_label else None
 
@@ -1994,8 +2062,12 @@ class MainWindow(ttk.Frame):
 
         root.columnconfigure(self._MAP_COL_MERCHANT, minsize=240)
         root.columnconfigure(self._MAP_COL_TYPE, minsize=420)
-        root.columnconfigure(self._MAP_COL_FINAL, minsize=160)
+        root.columnconfigure(self._MAP_COL_FINAL, minsize=200)
         root.columnconfigure(self._MAP_COL_SCOPE, minsize=180)
+
+        # Existing/saved category names to offer in each row's dropdown.
+        project = self._state.selected_project
+        suggestions = self._repo.suggested_category_names(project.id) if project else []
 
         for col, txt in (
             (self._MAP_COL_MERCHANT, "Merchant"),
@@ -2008,7 +2080,7 @@ class MainWindow(ttk.Frame):
             )
 
         for idx, rule in enumerate(rules):
-            self._build_mapping_row(idx + 1, rule)
+            self._build_mapping_row(idx + 1, rule, suggestions)
 
         total_rows = len(rules) + 1
         for sep_col in (
@@ -2021,7 +2093,7 @@ class MainWindow(ttk.Frame):
                 row=0, column=sep_col, rowspan=total_rows, sticky="ns", padx=4
             )
 
-    def _build_mapping_row(self, grid_row: int, rule: dict) -> None:
+    def _build_mapping_row(self, grid_row: int, rule: dict, suggestions: list) -> None:
         root = self._mappings_rows_root
 
         name_lbl = tk.Label(
@@ -2037,9 +2109,59 @@ class MainWindow(ttk.Frame):
                 type_frame, text=label, value=label, variable=type_var
             ).pack(side=tk.LEFT)
 
-        name_var = tk.StringVar(value=rule["final_name"])
-        name_entry = tk.Entry(root, textvariable=name_var, width=18, justify="center")
-        name_entry.grid(row=grid_row, column=self._MAP_COL_FINAL, sticky="w", padx=(4, 8), pady=3)
+        # Final category: a dropdown of saved/existing names, with "Other" at
+        # the top to swap in a free-text entry for a brand-new name.
+        final_frame = tk.Frame(root)
+        final_frame.grid(row=grid_row, column=self._MAP_COL_FINAL, sticky="ew", padx=(4, 8), pady=3)
+        final_frame.columnconfigure(0, weight=1)
+        combo_var = tk.StringVar()
+        name_var = tk.StringVar()
+        mode_var = tk.StringVar(value="list")
+
+        combo = ttk.Combobox(
+            final_frame,
+            textvariable=combo_var,
+            values=[self._ASSIGN_OTHER] + list(suggestions),
+            state="readonly",
+            justify="center",
+        )
+        entry_wrap = tk.Frame(final_frame)
+        entry_wrap.columnconfigure(0, weight=1)
+        entry = tk.Entry(entry_wrap, textvariable=name_var, justify="center")
+        entry.grid(row=0, column=0, sticky="ew")
+
+        def show_list() -> None:
+            mode_var.set("list")
+            entry_wrap.grid_remove()
+            combo.grid(row=0, column=0, sticky="ew")
+            combo_var.set("")
+
+        def show_other(focus: bool = True) -> None:
+            mode_var.set("other")
+            combo.grid_remove()
+            entry_wrap.grid(row=0, column=0, sticky="ew")
+            if focus:
+                entry.focus_set()
+
+        # Small button to return from the free-text entry to the dropdown.
+        ttk.Button(entry_wrap, text="\u25be", width=2, command=show_list).grid(
+            row=0, column=1, sticky="w", padx=(2, 0)
+        )
+
+        def _on_combo(_e=None) -> None:
+            if combo_var.get() == self._ASSIGN_OTHER:
+                show_other()
+
+        combo.bind("<<ComboboxSelected>>", _on_combo, add=True)
+
+        combo.grid(row=0, column=0, sticky="ew")
+        current_name = (rule["final_name"] or "").strip()
+        if current_name and current_name.lower() != "transfer":
+            if current_name in suggestions:
+                combo_var.set(current_name)
+            else:
+                name_var.set(current_name)
+                show_other(focus=False)
 
         scope_var = tk.StringVar(
             value="Global" if rule["scope"] == "global" else "Per-Project"
@@ -2063,7 +2185,9 @@ class MainWindow(ttk.Frame):
                 "merchant_key": rule["merchant_key"],
                 "orig_project_id": rule["project_id"],
                 "type_var": type_var,
-                "name_var": name_var,
+                "final_combo_var": combo_var,
+                "final_name_var": name_var,
+                "final_mode_var": mode_var,
                 "scope_var": scope_var,
             }
         )
@@ -2090,7 +2214,7 @@ class MainWindow(ttk.Frame):
         for w in self._mapping_row_widgets:
             type_label = w["type_var"].get()
             kind = self._type_label_to_kind(type_label) if type_label else None
-            name = w["name_var"].get().strip()
+            name = self._assign_final_name(w)
             scope = "global" if w["scope_var"].get() == "Global" else "project"
 
             # A rule must keep a Type and (unless Transfer) a final name.

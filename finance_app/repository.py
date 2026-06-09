@@ -850,6 +850,34 @@ class FinanceRepository:
         return self.create_category(project_id, name, CategoryKind(kind), year)
 
     # ----- Merchant rules (remembered mappings) --------------------------
+    def suggested_category_names(self, project_id: int) -> list[str]:
+        """Category names to offer when assigning a merchant: the project's own
+        finalized category names plus every final name saved in a merchant rule
+        (global, or scoped to this project). Distinct, case-insensitive sorted,
+        excluding the 'Transfer' placeholder."""
+        names: dict[str, str] = {}  # lower -> original casing
+
+        for r in self._conn.execute(
+            "SELECT DISTINCT name FROM categories WHERE project_id = ? AND is_temporary = 0;",
+            (project_id,),
+        ):
+            n = str(r["name"]).strip()
+            if n:
+                names.setdefault(n.lower(), n)
+
+        for r in self._conn.execute(
+            """
+            SELECT DISTINCT final_name FROM merchant_rules
+            WHERE scope = 'global' OR (scope = 'project' AND project_id = ?);
+            """,
+            (project_id,),
+        ):
+            n = str(r["final_name"]).strip()
+            if n and n.lower() != "transfer":
+                names.setdefault(n.lower(), n)
+
+        return sorted(names.values(), key=str.lower)
+
     def get_merchant_rule(
         self, project_id: int, merchant_key: str
     ) -> Optional[tuple[int, str, str]]:
