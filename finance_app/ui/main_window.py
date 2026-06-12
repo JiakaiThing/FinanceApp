@@ -40,9 +40,9 @@ try:
     from ..app_paths import database_path, ensure_app_data_exists
     from ..csv_import import (
         ColumnMapping,
+        assign_fingerprints,
         detect_mapping,
         file_signature,
-        group_by_merchant,
         parse_with_mapping,
         read_raw_rows,
     )
@@ -61,9 +61,9 @@ except ImportError:  # running as a script (no package context)
     from finance_app.app_paths import database_path, ensure_app_data_exists
     from finance_app.csv_import import (
         ColumnMapping,
+        assign_fingerprints,
         detect_mapping,
         file_signature,
-        group_by_merchant,
         parse_with_mapping,
         read_raw_rows,
     )
@@ -1160,14 +1160,21 @@ class MainWindow(ttk.Frame):
         area = ttk.Frame(parent)
         area.grid(row=1, column=4, sticky="ew", padx=(16, 0))
         self._import_area = area
-        # col1 = drop-zone (grows with the window, sized in _resize_drop_zone);
-        # col2 = notice, pinned to the right edge.
+        # col0 = Import CSV button; col1 = drop-zone (grows with the window,
+        # sized in _resize_drop_zone); col2 = Undo last import (to the right of
+        # the drop-zone); col3 = notice, pinned to the right edge.
         area.columnconfigure(1, weight=1)
-        area.columnconfigure(2, weight=0)
 
-        ttk.Button(
+        self._import_csv_btn = ttk.Button(
             area, text="Import CSV\u2026", command=self._choose_import_file
-        ).grid(row=0, column=0, sticky="w")
+        )
+        self._import_csv_btn.grid(row=0, column=0, sticky="w")
+
+        # Reverses the most recent import for the current project. Disabled
+        # when there's nothing to undo.
+        self._undo_import_btn = ttk.Button(
+            area, text="Undo last import", command=self._undo_last_import
+        )
 
         # Optional drag-and-drop zone (only when tkinterdnd2 loaded). Its width
         # scales with the window via _resize_drop_zone.
@@ -1200,7 +1207,16 @@ class MainWindow(ttk.Frame):
                 self._import_drop_label = drop
             except Exception:
                 pass
-            area.bind("<Configure>", lambda _e: self._resize_drop_zone(), add=True)
+            # Undo sits to the right of the drop zone.
+            self._undo_import_btn.grid(row=0, column=2, sticky="w", padx=(10, 0))
+        else:
+            # No drop zone — Undo sits beside the Import CSV button.
+            self._undo_import_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+
+        self._refresh_undo_import_button()
+
+        # Rescale the drop zone as the window width changes.
+        area.bind("<Configure>", lambda _e: self._resize_drop_zone(), add=True)
 
         # Notice (hidden until there are unassigned temporary merchants),
         # pinned to the right so the message sits beside the Assign now button.
@@ -1258,6 +1274,39 @@ class MainWindow(ttk.Frame):
             return
         self._import_statement_file(path)
 
+    def _refresh_undo_import_button(self) -> None:
+        """Enable 'Undo last import' only when the current project has an
+        import batch to reverse."""
+        btn = getattr(self, "_undo_import_btn", None)
+        if btn is None:
+            return
+        project = self._state.selected_project
+        has_batch = bool(project) and self._repo.last_import_batch_id(project.id) is not None
+        btn.configure(state=(tk.NORMAL if has_batch else tk.DISABLED))
+
+    def _undo_last_import(self) -> None:
+        """Reverse the most recent CSV import for the current project."""
+        project = self._state.selected_project
+        if not project:
+            return
+        batch_id = self._repo.last_import_batch_id(project.id)
+        if batch_id is None:
+            return
+        if not messagebox.askyesno(
+            title="Undo last import",
+            message=(
+                "Reverse the most recent import? This subtracts the amounts it "
+                "added and removes any temporary columns it created. Merchants "
+                "you've already assigned to a category since importing can't be "
+                "reversed and will be left as-is."
+            ),
+        ):
+            return
+        self._repo.undo_import_batch(project.id, batch_id)
+        self._reload_project_view()
+        self._refresh_import_notice()
+        self._refresh_undo_import_button()
+
     def _refresh_import_notice(self) -> None:
         """Show the assign-notice iff the current project has unassigned
         temporary merchant categories."""
@@ -1268,7 +1317,7 @@ class MainWindow(ttk.Frame):
         if show:
             # Pin to the right edge so the message sits beside the Assign now
             # button.
-            self._import_notice.grid(row=0, column=2, sticky="e", padx=(12, 0))
+            self._import_notice.grid(row=0, column=3, sticky="e", padx=(12, 0))
         else:
             self._import_notice.grid_remove()
         # Notice presence changes how much room the drop-zone gets.
@@ -1303,10 +1352,11 @@ class MainWindow(ttk.Frame):
         ratio = min(win_w / screen_w, 1.0)
         chars = self._DROP_BASE_CHARS * 3 * ratio
 
-        # Safety: never let the zone crowd out the Import button + notice.
+        # Safety: never let the zone crowd out the Import button, the Undo
+        # button (sits to the zone's right), and the notice.
         avail = area.winfo_width()
         if avail > 1:
-            reserve = 140
+            reserve = 260
             if hasattr(self, "_import_notice") and self._import_notice.winfo_ismapped():
                 reserve += 280
             chars = min(chars, (avail - reserve) / 7)
@@ -1372,55 +1422,106 @@ class MainWindow(ttk.Frame):
             )
             return
 
-        groups = group_by_merchant(result.transactions)
-        auto_assigned = 0
-        new_merchants = 0
-        transfers_dropped = 0
+        # Fingerprint every transaction and drop any already imported into this
+        # project, so re-importing the same (or an overlapping) file doesn't
+        # double-count. Only genuinely-new transactions proceed.
+        fingerprinted = assign_fingerprints(result.transactions)
+        already = self._repo.existing_import_fingerprints(
+            project.id, [fp for _txn, fp in fingerprinted]
+        )
+        new_items = [(txn, fp) for txn, fp in fingerprinted if fp not in already]
+        skipped_dupes = len(fingerprinted) - len(new_items)
 
-        for key, grp in groups.items():
-            rule = self._repo.get_merchant_rule(project.id, key)
+        if not new_items:
+            messagebox.showinfo(
+                title="Already imported",
+                message=(
+                    f"All {len(fingerprinted)} transaction(s) in this file have "
+                    "already been imported into this project, so nothing was added."
+                ),
+            )
+            return
+
+        # Confirm before changing anything, surfacing the new-vs-skipped split.
+        confirm_lines = [f"{len(new_items)} new transaction(s) will be imported."]
+        if skipped_dupes:
+            confirm_lines.append(
+                f"{skipped_dupes} already-imported transaction(s) will be skipped."
+            )
+        confirm_lines.append("\nImport now?")
+        if not messagebox.askyesno(
+            title="Confirm import", message="\n".join(confirm_lines)
+        ):
+            return
+
+        batch_id = self._repo.begin_import_batch(project.id)
+
+        auto_keys: set[str] = set()
+        new_keys: set[str] = set()
+        transfer_keys: set[str] = set()
+        # Cache lookups so each merchant resolves its rule / target once.
+        rule_cache: dict[str, Optional[tuple]] = {}
+        real_target: dict[tuple[str, int], int] = {}
+        temp_target: dict[tuple[str, int], int] = {}
+
+        for txn, fp in new_items:
+            key = txn.merchant_key
+            if key not in rule_cache:
+                rule_cache[key] = self._repo.get_merchant_rule(project.id, key)
+            rule = rule_cache[key]
+
             if rule is not None:
                 kind, final_name, _scope = rule
                 if kind == self._repo.TRANSFER_KIND:
-                    transfers_dropped += 1
+                    transfer_keys.add(key)
                     continue
-                for (yr, mo), cents in grp.monthly_cents.items():
+                cache_key = (key, txn.year)
+                target_id = real_target.get(cache_key)
+                if target_id is None:
                     target_id = self._repo.get_or_create_real_category(
-                        project.id, final_name, kind, yr
+                        project.id, final_name, kind, txn.year
                     )
-                    self._repo.import_amount_into_category(project.id, target_id, yr, mo, cents)
-                auto_assigned += 1
+                    real_target[cache_key] = target_id
+                auto_keys.add(key)
             else:
-                # Unknown merchant -> temporary category per affected year.
-                new_merchants += 1
-                years = {yr for (yr, _mo) in grp.monthly_cents.keys()}
-                temp_by_year: dict[int, int] = {}
-                for yr in years:
-                    temp_by_year[yr] = self._repo.create_temp_category(
-                        project.id, grp.display_name, key, yr
+                # Unknown merchant -> reuse its temporary column for the year if
+                # one already exists, otherwise create it.
+                cache_key = (key, txn.year)
+                target_id = temp_target.get(cache_key)
+                if target_id is None:
+                    target_id = self._repo.find_temp_category(
+                        project.id, key, txn.year
+                    ) or self._repo.create_temp_category(
+                        project.id, txn.display_name, key, txn.year
                     )
-                for (yr, mo), cents in grp.monthly_cents.items():
-                    self._repo.import_amount_into_category(
-                        project.id, temp_by_year[yr], yr, mo, cents
-                    )
+                    temp_target[cache_key] = target_id
+                new_keys.add(key)
+
+            self._repo.import_transaction(
+                batch_id, project.id, target_id, txn.year, txn.month, txn.amount_cents, fp
+            )
 
         self._reload_project_view()
         self._refresh_import_notice()
+        self._refresh_undo_import_button()
 
         summary = [
-            f"Imported {len(result.transactions)} transaction(s) "
-            f"across {len(groups)} merchant(s)."
+            f"Imported {len(new_items)} transaction(s) "
+            f"across {len(auto_keys) + len(new_keys) + len(transfer_keys)} merchant(s)."
         ]
-        if auto_assigned:
-            summary.append(f"{auto_assigned} merchant(s) auto-matched to saved categories.")
-        if transfers_dropped:
-            summary.append(f"{transfers_dropped} known transfer merchant(s) skipped.")
-        if new_merchants:
+        if skipped_dupes:
+            summary.append(f"{skipped_dupes} duplicate transaction(s) skipped (already imported).")
+        if auto_keys:
+            summary.append(f"{len(auto_keys)} merchant(s) auto-matched to saved categories.")
+        if transfer_keys:
+            summary.append(f"{len(transfer_keys)} known transfer merchant(s) skipped.")
+        if new_keys:
             summary.append(
-                f"{new_merchants} new merchant(s) need assigning — use \u201cAssign now\u201d."
+                f"{len(new_keys)} new merchant(s) need assigning — use \u201cAssign now\u201d."
             )
         if result.errors:
             summary.append(f"{len(result.errors)} row(s) skipped (unreadable).")
+        summary.append("\nUse \u201cUndo last import\u201d to reverse this if needed.")
         messagebox.showinfo(title="Import complete", message="\n".join(summary))
 
     # ----- Import mapping dialog (hybrid: confirm auto-detected layout) ---
@@ -2284,6 +2385,7 @@ class MainWindow(ttk.Frame):
             self._charts.reload_project_options()
             self._charts.refresh_charts()
         self._refresh_import_notice()
+        self._refresh_undo_import_button()
         if hasattr(self, "_sections_scroll"):
             self.after_idle(self._sections_scroll.snap_to_top)
 
@@ -3577,8 +3679,17 @@ def run_app() -> None:
     # the app still launches (drag-and-drop just silently disables).
     root = _create_root()
     root.title("Finance App")
-    root.geometry("1040x820")
     root.minsize(720, 560)
+    # Open wide enough that the Add Entry row (incl. the import buttons) fits
+    # without overflow, but never larger than the screen; centre the window.
+    want_w, want_h = 1240, 840
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    win_w = min(want_w, screen_w - 80)
+    win_h = min(want_h, screen_h - 80)
+    pos_x = max((screen_w - win_w) // 2, 0)
+    pos_y = max((screen_h - win_h) // 2 - 20, 0)
+    root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
     _apply_window_icon(root)
 
     app = MainWindow(root, repo)

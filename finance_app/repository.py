@@ -161,6 +161,36 @@ class FinanceRepository:
           name TEXT NOT NULL,
           mapping_json TEXT NOT NULL
         );
+
+        -- One row per CSV import run, so an import can be rolled back as a
+        -- single unit ("Undo last import").
+        CREATE TABLE IF NOT EXISTS import_batches (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_id INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+
+        -- Ledger of every transaction ever imported, used to skip duplicates
+        -- on re-import. ``fingerprint`` identifies a transaction (date +
+        -- amount + description + occurrence) uniquely per project. The cell it
+        -- landed in and the exact contribution applied are stored so undoing
+        -- the batch can subtract precisely.
+        CREATE TABLE IF NOT EXISTS imported_transactions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_id INTEGER NOT NULL,
+          batch_id INTEGER NOT NULL,
+          fingerprint TEXT NOT NULL,
+          category_id INTEGER,
+          year INTEGER NOT NULL,
+          month INTEGER NOT NULL,
+          contribution_cents INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(project_id, fingerprint),
+          FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+          FOREIGN KEY (batch_id) REFERENCES import_batches(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_imported_txn_project ON imported_transactions(project_id);
+        CREATE INDEX IF NOT EXISTS idx_imported_txn_batch ON imported_transactions(batch_id);
         """
         with self._conn:
             self._conn.executescript(schema)
@@ -1135,6 +1165,134 @@ class FinanceRepository:
             "SELECT signature, name, mapping_json FROM csv_format_profiles ORDER BY name;"
         ).fetchall()
         return [(str(r["signature"]), str(r["name"]), str(r["mapping_json"])) for r in rows]
+
+    # ----- Import ledger & batches (duplicate-import safeguards) ----------
+    def existing_import_fingerprints(
+        self, project_id: int, fingerprints: list[str]
+    ) -> set[str]:
+        """Of the given fingerprints, return those already imported into this
+        project (so the caller can skip re-importing duplicates)."""
+        found: set[str] = set()
+        if not fingerprints:
+            return found
+        # Query in chunks to stay well under SQLite's variable limit.
+        for start in range(0, len(fingerprints), 400):
+            chunk = fingerprints[start : start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"""
+                SELECT fingerprint FROM imported_transactions
+                WHERE project_id = ? AND fingerprint IN ({placeholders});
+                """,
+                (project_id, *chunk),
+            ).fetchall()
+            found.update(str(r["fingerprint"]) for r in rows)
+        return found
+
+    def begin_import_batch(self, project_id: int) -> int:
+        """Create an import batch row and return its id."""
+        with self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO import_batches (project_id, created_at) VALUES (?, ?);",
+                (project_id, datetime.now().isoformat(timespec="seconds")),
+            )
+        return int(cur.lastrowid)
+
+    def import_transaction(
+        self,
+        batch_id: int,
+        project_id: int,
+        category_id: int,
+        year: int,
+        month: int,
+        signed_cents: int,
+        fingerprint: str,
+    ) -> None:
+        """Add one transaction's amount to its target cell and record it in the
+        ledger (so it won't be re-imported) under the given batch."""
+        kind_row = self._conn.execute(
+            "SELECT kind, is_temporary FROM categories WHERE id = ?;", (category_id,)
+        ).fetchone()
+        if not kind_row:
+            return
+        kind = int(kind_row["kind"])
+        is_temp = int(kind_row["is_temporary"]) != 0
+        contribution = self._kind_signed_contribution(kind, is_temp, signed_cents)
+        existing = self.get_monthly_amount_cents(category_id, year, month) or 0
+        with self._conn:
+            self._raw_set_amount(project_id, category_id, year, month, existing + contribution)
+            self._conn.execute(
+                """
+                INSERT INTO imported_transactions
+                    (project_id, batch_id, fingerprint, category_id, year, month, contribution_cents)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, fingerprint) DO NOTHING;
+                """,
+                (project_id, batch_id, fingerprint, category_id, year, month, contribution),
+            )
+
+    def last_import_batch_id(self, project_id: int) -> Optional[int]:
+        """The most recent import batch for a project, or None if none exist."""
+        row = self._conn.execute(
+            "SELECT id FROM import_batches WHERE project_id = ? ORDER BY id DESC LIMIT 1;",
+            (project_id,),
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+    def undo_import_batch(self, project_id: int, batch_id: int) -> int:
+        """Reverse an import batch: subtract each recorded contribution from its
+        cell, drop temporary categories the batch created that end up empty, and
+        delete the batch + its ledger rows. Returns the number of ledger rows
+        reversed. Cells whose category was since assigned/merged away are
+        skipped (the amounts already moved elsewhere)."""
+        rows = self._conn.execute(
+            """
+            SELECT id, category_id, year, month, contribution_cents
+            FROM imported_transactions
+            WHERE project_id = ? AND batch_id = ?;
+            """,
+            (project_id, batch_id),
+        ).fetchall()
+
+        touched_temp: set[int] = set()
+        reversed_count = 0
+        with self._conn:
+            for r in rows:
+                cat_id = r["category_id"]
+                if cat_id is None:
+                    continue
+                cat_id = int(cat_id)
+                cat = self._conn.execute(
+                    "SELECT is_temporary FROM categories WHERE id = ?;", (cat_id,)
+                ).fetchone()
+                if cat is None:
+                    # Category was assigned/merged away; can't safely reverse.
+                    continue
+                year = int(r["year"])
+                month = int(r["month"])
+                existing = self.get_monthly_amount_cents(cat_id, year, month) or 0
+                self._raw_set_amount(
+                    project_id, cat_id, year, month, existing - int(r["contribution_cents"])
+                )
+                if int(cat["is_temporary"]) != 0:
+                    touched_temp.add(cat_id)
+                reversed_count += 1
+
+            # Remove temporary columns the import created that are now empty.
+            for cat_id in touched_temp:
+                left = self._conn.execute(
+                    "SELECT 1 FROM monthly_amounts WHERE category_id = ? LIMIT 1;",
+                    (cat_id,),
+                ).fetchone()
+                if left is None:
+                    self._conn.execute("DELETE FROM categories WHERE id = ?;", (cat_id,))
+
+            self._conn.execute(
+                "DELETE FROM imported_transactions WHERE project_id = ? AND batch_id = ?;",
+                (project_id, batch_id),
+            )
+            self._conn.execute("DELETE FROM import_batches WHERE id = ?;", (batch_id,))
+        return reversed_count
 
     def get_month_grid(self, project_id: int, year: int) -> dict[tuple[int, int], int]:
         rows = self._conn.execute(

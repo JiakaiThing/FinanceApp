@@ -79,6 +79,7 @@ Instead of typing every transaction by hand, you can import a bank-statement CSV
 
 - **Import CSV…** — opens a file picker for a `.csv` file.
 - **Drop .CSV file here** — drag a `.csv` straight from File Explorer onto this zone. *(Drag-and-drop needs the optional `tkinterdnd2` package — see Quick start. Without it you still get the button.)*
+- **Undo last import** — sits to the right of the drop zone; reverses the most recent import for the current project (see *Duplicate-import safeguards* below). Disabled when there's nothing to undo.
 - **Manage mappings…** — top-right corner of the Add Entry box; opens the saved-rules editor (see *Managing saved rules* below).
 
 **What happens on import:**
@@ -104,6 +105,16 @@ A table lists every unassigned merchant. For each one you choose:
 - **Remembered rules:** once assigned, the same merchant in a future CSV auto-assigns straight to its final category — no temporary step. `Global` rules apply in every project; `Per-Project` rules only in the project you saved them in.
 - **Managing saved rules:** click **Manage mappings…** (top-right of the Add Entry box) to see every saved merchant rule. You can edit each rule's **Type**, **Final category** (the same dropdown of existing names, with **Other** to type a new one), and **Mapping** scope inline, then click **Save** (switching a rule to *Per-Project* applies it to the project you're viewing). Or click **Delete** on a row to forget it — that merchant will become a temporary category again on the next import. Editing or deleting a rule does **not** touch amounts already imported into your categories.
 - **Partial saves:** click **Save** and any fully-filled rows are assigned immediately. The window closes either way. Rows missing a Type, Mapping, or name stay temporary, and your in-progress selections are saved as a draft so they're restored when you reopen the window via **Assign now**.
+
+**Duplicate-import safeguards:**
+
+The app remembers every transaction it has imported into a project, so importing carefully never silently double-counts:
+
+- **Confirmation first.** Before anything changes, a dialog shows how many transactions are new versus already-imported, and you confirm the import.
+- **Duplicate detection.** Each transaction is identified by its date, amount and description. Re-importing the **same file** adds nothing (every row is recognised as already imported); importing an **overlapping** statement only adds the transactions it hasn't seen before. Two genuinely-identical transactions (e.g. two same-priced coffees on the same day) are both kept.
+- **No duplicate columns.** Re-importing an unassigned merchant reuses its existing temporary column instead of creating a second one.
+- **Undo last import.** Click **Undo last import** to roll back the most recent import for the project — it subtracts the amounts that import added and removes any temporary columns it created. Merchants you've already assigned to a real category since importing can't be reversed and are left as-is, so undo right after importing if you want a clean rollback.
+- **Manual edits win.** The app stores one value per cell with no record of which part came from a CSV, so a manual edit simply overrides the cell. Future imports only add genuinely-new transactions on top of whatever is there.
 
 > **Tip:** Right-click a light-red temporary column header in the grid to jump straight to **Assign now**, or to delete that merchant column outright.
 
@@ -331,7 +342,7 @@ To swap in your own logo:
 - Wheel scrolling is tuned to feel browser-like: pixel-precise canvas (`yscrollincrement=1`), capped per-event delta, proportional steps inside Treeviews, and a paint-flush gate that only fires during fast wheel bursts (see `_WheelScrollPaintGate` in `widgets.py`). Shift+wheel inside a wide table scrolls horizontally at roughly 3× the per-tick column step of vertical wheel.
 - **Cell navigation & undo/redo:** the Month-grid editor is a custom `TreeviewCellEditor` in `widgets.py` that intercepts `KeyPress-Tab` / `KeyPress-Shift-Tab` / `KeyPress-Return` to override Tk's default focus traversal, calls `tree.see(...)` + retries `tree.bbox(...)` so an off-screen target cell still gets a valid Entry overlay, and reports back via an `on_navigate(direction)` callback. Undo/redo is two stacks of `(item_id, col_id, old_cents, new_cents)` snapshots maintained by `main_window.py` and bound globally to `Ctrl+Z` / `Ctrl+Y`.
 - **CSV import** lives in `finance_app/csv_import.py`: a `ColumnMapping` dataclass plus `read_raw_rows` → `detect_mapping` (heuristic auto-detect of date/description/amount columns, header, date format, signed vs debit/credit) → `parse_with_mapping`, with `file_signature` fingerprinting a layout so the same bank is recognised next time. Merchant keys are the first 1–3 description words (transfers keep the full description); `group_by_merchant` sums cents per `(year, month)`.
-- **Import persistence** adds three tables in `repository.py`: `csv_format_profiles` (signature → saved `ColumnMapping`), `merchant_rules` (remembered merchant → category mappings, `project`- or `global`-scoped), and `merchant_drafts` (in-progress Assign-window selections). Categories carry `is_temporary` / `merchant_key` flags; all aggregate queries filter out `is_temporary` rows so unassigned merchants never hit a total or chart.
+- **Import persistence** adds five tables in `repository.py`: `csv_format_profiles` (signature → saved `ColumnMapping`), `merchant_rules` (remembered merchant → category mappings, `project`- or `global`-scoped), `merchant_drafts` (in-progress Assign-window selections), `import_batches` (one row per import run, so an import can be undone as a unit), and `imported_transactions` (a per-project ledger of every imported transaction, keyed by a date+amount+description fingerprint, used to skip duplicates on re-import and to reverse a batch). Categories carry `is_temporary` / `merchant_key` flags; all aggregate queries filter out `is_temporary` rows so unassigned merchants never hit a total or chart.
 ---
 
 ## Troubleshooting
@@ -351,4 +362,6 @@ To swap in your own logo:
 | A merchant keeps coming back as temporary on each import | Its rule was saved **Per-Project** and you're importing into a different project, or it was never fully assigned. Re-assign it and pick **Global** to share the mapping across all projects. |
 | The **Set up bank CSV format** dialog opens every time for the same bank | The file's structure is changing between exports (different column count / header), so it doesn't match the saved profile's signature. Confirm the mapping once more and it'll be remembered for that new layout. |
 | An import column vanished after assigning it | You set its **Type** to **Transfer** — transfers are money moved between your own accounts, so the column is removed from the grid by design. |
+| I imported the same file twice but values didn't double | Expected — the app remembers imported transactions and skips duplicates. The confirmation dialog shows how many were new vs already-imported. |
+| **Undo last import** didn't fully reverse an import | Merchants you'd already assigned to a real category since importing can't be reversed (their amounts moved into the assigned column). Undo right after importing, before assigning, for a clean rollback. |
 | Want to start fresh | Close the app, delete `%LOCALAPPDATA%\FinanceApp\finance.db`, relaunch. (Make a backup first if you might want it back.) |

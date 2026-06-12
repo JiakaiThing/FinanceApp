@@ -67,6 +67,7 @@ class ParsedTransaction:
     merchant_key: str  # normalised key used for grouping + rule matching
     display_name: str  # column label for the temporary category
     is_transfer: bool
+    day: int = 0  # day-of-month of the transaction (0 when unknown)
 
 
 @dataclass
@@ -501,7 +502,7 @@ def parse_with_mapping(rows: list[list[str]], mapping: ColumnMapping) -> ParseRe
         if ymd is None:
             result.errors.append((line_no, ",".join(row), f"Bad date: {date_raw!r}"))
             continue
-        year, month, _day = ymd
+        year, month, day = ymd
 
         key, display = merchant_key_for(description)
         result.transactions.append(
@@ -513,6 +514,7 @@ def parse_with_mapping(rows: list[list[str]], mapping: ColumnMapping) -> ParseRe
                 merchant_key=key,
                 display_name=display,
                 is_transfer=is_transfer_description(description),
+                day=day,
             )
         )
 
@@ -569,3 +571,31 @@ def group_by_merchant(transactions: list[ParsedTransaction]) -> dict[str, Mercha
         grp.monthly_cents[ym] = grp.monthly_cents.get(ym, 0) + txn.amount_cents
         grp.txn_count += 1
     return groups
+
+
+def assign_fingerprints(
+    transactions: list[ParsedTransaction],
+) -> list[tuple[ParsedTransaction, str]]:
+    """Pair each transaction with a stable fingerprint string for dedup.
+
+    The fingerprint is built from the transaction's date, signed amount and
+    description. Because two genuinely-identical transactions can occur (e.g.
+    two same-priced coffees on the same day), an occurrence index is appended
+    so the Nth identical line is distinct from the others. Re-importing the
+    same file reproduces the same fingerprints, so they all match and get
+    skipped; an overlapping statement only adds the lines not seen before.
+    """
+    seen: dict[str, int] = {}
+    out: list[tuple[ParsedTransaction, str]] = []
+    for txn in transactions:
+        base = "|".join(
+            (
+                f"{txn.year:04d}-{txn.month:02d}-{txn.day:02d}",
+                str(txn.amount_cents),
+                txn.description.strip().lower(),
+            )
+        )
+        occ = seen.get(base, 0)
+        seen[base] = occ + 1
+        out.append((txn, f"{base}#{occ}"))
+    return out
