@@ -566,8 +566,7 @@ class MainWindow(ttk.Frame):
     # data-entry experience).
     def _build_month_summary_section(self, parent: ttk.Frame) -> None:
         """Month Summary section: month picker + totals + 12-month editable grid."""
-        # Top: month dropdown + Total Expenses / Total Income / Net /
-        # End of Month (left half only; see ``sum_wrap`` below).
+        # Top: month dropdown + live totals for the selected month (or All).
         summary_top = ttk.Frame(parent)
         summary_top.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(summary_top, text="Month").pack(side=tk.LEFT)
@@ -638,6 +637,13 @@ class MainWindow(ttk.Frame):
             self._som_value_label,
             self._eom_value_label,
         ) = self._build_summary_metric_row(sum_row, cells)
+
+        # Read-only report of import merchants for the selected month.
+        ttk.Button(
+            sum_row,
+            text="Manage Month Mapping",
+            command=self._open_manage_month_mapping_window,
+        ).grid(row=0, column=len(cells), sticky="w", padx=(8, 0), pady=(20, 0))
 
         # Editable 12-month grid (former "Month Breakdown" tab table)
         grid_wrap = ttk.Frame(parent)
@@ -1152,10 +1158,15 @@ class MainWindow(ttk.Frame):
         # Row 1 is the entry/Add-button row, so the import button, drop-zone
         # and notice share that baseline.
         # Manage mappings sits in the empty top-right corner (the label row),
-        # above the import controls / notice.
-        ttk.Button(
-            parent, text="Manage mappings\u2026", command=self._open_manage_mappings_window
-        ).grid(row=0, column=4, sticky="e", padx=(16, 0))
+        # above the import controls / notice. Same width as Undo last import.
+        self._import_action_btn_width = 18
+        self._manage_mappings_btn = ttk.Button(
+            parent,
+            text="Manage mappings",
+            command=self._open_manage_mappings_window,
+            width=self._import_action_btn_width,
+        )
+        self._manage_mappings_btn.grid(row=0, column=4, sticky="e", padx=(16, 0))
 
         area = ttk.Frame(parent)
         area.grid(row=1, column=4, sticky="ew", padx=(16, 0))
@@ -1173,7 +1184,10 @@ class MainWindow(ttk.Frame):
         # Reverses the most recent import for the current project. Disabled
         # when there's nothing to undo.
         self._undo_import_btn = ttk.Button(
-            area, text="Undo last import", command=self._undo_last_import
+            area,
+            text="Undo last import",
+            command=self._undo_last_import,
+            width=self._import_action_btn_width,
         )
 
         # Optional drag-and-drop zone (only when tkinterdnd2 loaded). Its width
@@ -1186,7 +1200,7 @@ class MainWindow(ttk.Frame):
                 borderwidth=1,
                 padx=10,
                 pady=6,
-                width=22,
+                width=16,
                 foreground="#666666",
             )
             drop.grid(row=0, column=1, sticky="ew", padx=(10, 0))
@@ -1207,11 +1221,11 @@ class MainWindow(ttk.Frame):
                 self._import_drop_label = drop
             except Exception:
                 pass
-            # Undo sits to the right of the drop zone.
-            self._undo_import_btn.grid(row=0, column=2, sticky="w", padx=(10, 0))
+            # Undo sits to the right of the drop zone, same width as Manage mappings.
+            self._undo_import_btn.grid(row=0, column=2, sticky="ew", padx=(10, 0))
         else:
             # No drop zone — Undo sits beside the Import CSV button.
-            self._undo_import_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+            self._undo_import_btn.grid(row=0, column=2, sticky="ew", padx=(8, 0))
 
         self._refresh_undo_import_button()
 
@@ -1323,9 +1337,9 @@ class MainWindow(ttk.Frame):
         # Notice presence changes how much room the drop-zone gets.
         self._resize_drop_zone()
 
-    # Drop-zone base width (chars). At a full-screen window the zone is shown
-    # at 3x this; narrower windows scale down by the same window/screen ratio.
-    _DROP_BASE_CHARS = 22
+    # Drop-zone base width (chars). Scales slightly with the window but stays
+    # compact so the Undo button beside it can match Manage mappings above.
+    _DROP_BASE_CHARS = 16
 
     def _resize_drop_zone(self) -> None:
         """Recompute the drag-and-drop label width.
@@ -1348,12 +1362,12 @@ class MainWindow(ttk.Frame):
         if win_w <= 1 or screen_w <= 1:
             return
 
-        # Triple at full screen, proportional below.
+        # Compact drop zone: ~1.5× base at full screen, proportional below.
         ratio = min(win_w / screen_w, 1.0)
-        chars = self._DROP_BASE_CHARS * 3 * ratio
+        chars = self._DROP_BASE_CHARS * 1.5 * ratio
 
         # Safety: never let the zone crowd out the Import button, the Undo
-        # button (sits to the zone's right), and the notice.
+        # button (fixed width, to the zone's right), and the notice.
         avail = area.winfo_width()
         if avail > 1:
             reserve = 260
@@ -1362,7 +1376,7 @@ class MainWindow(ttk.Frame):
             chars = min(chars, (avail - reserve) / 7)
 
         try:
-            drop.configure(width=int(max(self._DROP_BASE_CHARS, chars)))
+            drop.configure(width=int(max(12, chars)))
         except Exception:
             pass
 
@@ -1463,6 +1477,7 @@ class MainWindow(ttk.Frame):
         rule_cache: dict[str, Optional[tuple]] = {}
         real_target: dict[tuple[str, int], int] = {}
         temp_target: dict[tuple[str, int], int] = {}
+        touched_categories: set[tuple[int, int]] = set()  # (category_id, year)
 
         for txn, fp in new_items:
             key = txn.merchant_key
@@ -1498,7 +1513,28 @@ class MainWindow(ttk.Frame):
                 new_keys.add(key)
 
             self._repo.import_transaction(
-                batch_id, project.id, target_id, txn.year, txn.month, txn.amount_cents, fp
+                batch_id,
+                project.id,
+                target_id,
+                txn.year,
+                txn.month,
+                txn.amount_cents,
+                fp,
+                txn.merchant_key,
+                txn.display_name,
+            )
+            touched_categories.add((target_id, txn.year))
+
+        # If the current view month has no imported row for a touched category,
+        # pad that cell with $0 (undo removes this padding).
+        view_year = self._state.year
+        view_month = self._state.month
+        touched_in_view_year = {
+            cat_id for cat_id, year in touched_categories if year == view_year
+        }
+        for cat_id in touched_in_view_year:
+            self._repo.zero_fill_import_category_month(
+                project.id, cat_id, view_year, view_month, batch_id
             )
 
         self._reload_project_view()
@@ -1783,8 +1819,8 @@ class MainWindow(ttk.Frame):
         # Sized so the whole table (name + 5 type radios + name entry + 2
         # mapping radios + separators + scrollbar) fits without horizontal
         # scrolling, even at the minimum size.
-        win.geometry("1185x600")
-        win.minsize(1175, 380)
+        win.geometry("1285x600")
+        win.minsize(1275, 380)
         self._assign_win = win
 
         header = ttk.Label(
@@ -1816,12 +1852,13 @@ class MainWindow(ttk.Frame):
         win.protocol("WM_DELETE_WINDOW", _on_close)
         self._populate_assign_rows()
 
-    # Shared column layout for the assign grid. Data columns are 1/3/5/7;
-    # the odd-numbered gaps (2/4/6) hold vertical separators.
+    # Shared column layout for the assign grid. Data columns are 1/3/5/7/9;
+    # the even gaps (2/4/6/8) hold vertical separators.
     _ASSIGN_COL_NAME = 1
-    _ASSIGN_COL_TYPE = 3
-    _ASSIGN_COL_FINAL = 5
-    _ASSIGN_COL_MAPPING = 7
+    _ASSIGN_COL_AMOUNT = 3
+    _ASSIGN_COL_TYPE = 5
+    _ASSIGN_COL_FINAL = 7
+    _ASSIGN_COL_MAPPING = 9
 
     def _populate_assign_rows(self) -> None:
         """(Re)build the merchant rows from the current temp categories.
@@ -1848,9 +1885,10 @@ class MainWindow(ttk.Frame):
 
         # Fixed minimum widths keep headers and cells aligned; the name column
         # is widest so long "Transfer ..." descriptions wrap.
-        root.columnconfigure(self._ASSIGN_COL_NAME, minsize=250)
+        root.columnconfigure(self._ASSIGN_COL_NAME, minsize=220)
+        root.columnconfigure(self._ASSIGN_COL_AMOUNT, minsize=90)
         root.columnconfigure(self._ASSIGN_COL_TYPE, minsize=420)
-        root.columnconfigure(self._ASSIGN_COL_FINAL, minsize=220)
+        root.columnconfigure(self._ASSIGN_COL_FINAL, minsize=200)
         root.columnconfigure(self._ASSIGN_COL_MAPPING, minsize=200)
 
         # Existing/saved category names to offer in each row's dropdown.
@@ -1859,6 +1897,7 @@ class MainWindow(ttk.Frame):
         # Header row.
         for col, txt in (
             (self._ASSIGN_COL_NAME, "Temporary category"),
+            (self._ASSIGN_COL_AMOUNT, "Amount"),
             (self._ASSIGN_COL_TYPE, "Type"),
             (self._ASSIGN_COL_FINAL, "Final category name"),
             (self._ASSIGN_COL_MAPPING, "Mapping"),
@@ -1867,13 +1906,14 @@ class MainWindow(ttk.Frame):
                 row=0, column=col, sticky="w", padx=(4, 8), pady=(0, 4)
             )
 
-        for idx, (key, display) in enumerate(merchants):
-            self._build_assign_row(idx + 1, key, display, suggestions)
+        for idx, (key, display, amount_cents) in enumerate(merchants):
+            self._build_assign_row(idx + 1, key, display, amount_cents, suggestions)
 
         # Vertical separators between sections, spanning header + all rows.
         total_rows = len(merchants) + 1
         for sep_col in (
             self._ASSIGN_COL_NAME + 1,
+            self._ASSIGN_COL_AMOUNT + 1,
             self._ASSIGN_COL_TYPE + 1,
             self._ASSIGN_COL_FINAL + 1,
         ):
@@ -1882,7 +1922,7 @@ class MainWindow(ttk.Frame):
             )
 
     def _build_assign_row(
-        self, grid_row: int, key: str, display: str, suggestions: list
+        self, grid_row: int, key: str, display: str, amount_cents: int, suggestions: list
     ) -> None:
         project = self._state.selected_project
         draft = self._repo.get_merchant_draft(project.id, key) if project else None
@@ -1899,8 +1939,17 @@ class MainWindow(ttk.Frame):
         root = self._assign_rows_root
 
         # wraplength lets long transfer descriptions span multiple lines.
-        name_lbl = tk.Label(root, text=display, anchor="w", justify="left", wraplength=250)
+        name_lbl = tk.Label(root, text=display, anchor="w", justify="left", wraplength=220)
         name_lbl.grid(row=grid_row, column=self._ASSIGN_COL_NAME, sticky="w", padx=(4, 8), pady=3)
+
+        amount_lbl = tk.Label(
+            root,
+            text=_money_from_cents(amount_cents),
+            anchor="center",
+            justify="center",
+        )
+        # Signed sum of every imported cent for this merchant in the file.
+        amount_lbl.grid(row=grid_row, column=self._ASSIGN_COL_AMOUNT, sticky="ew", padx=(4, 8), pady=3)
 
         type_var = tk.StringVar(value=self._kind_to_type_label(draft_kind))
         type_frame = tk.Frame(root)
@@ -1982,6 +2031,7 @@ class MainWindow(ttk.Frame):
                 "key": key,
                 "display": display,
                 "name_lbl": name_lbl,
+                "amount_lbl": amount_lbl,
                 "type_var": type_var,
                 "final_combo_var": combo_var,
                 "final_name_var": name_var,
@@ -2090,6 +2140,128 @@ class MainWindow(ttk.Frame):
                     "via Assign now."
                 ),
             )
+
+    # ----- Manage month mapping (read-only view for selected month) --------
+    def _summary_scope_month(self) -> Optional[int]:
+        """The single month the Month Summary dropdown is scoped to, or None
+        when it is set to All."""
+        if hasattr(self, "_summary_month_var"):
+            label = self._summary_month_var.get()
+            if label and label != "All":
+                try:
+                    return EN_MONTHS.index(label) + 1
+                except ValueError:
+                    pass
+        return None
+
+    def _open_manage_month_mapping_window(self) -> None:
+        """Show merchant import mappings for the Month Summary's selected month."""
+        project = self._state.selected_project
+        if not project:
+            return
+
+        month = self._summary_scope_month()
+        if month is None:
+            messagebox.showinfo(
+                title="Manage Month Mapping",
+                message=(
+                    "Select a single month in the Month Summary dropdown "
+                    "(not All) to view that month's import mappings."
+                ),
+            )
+            return
+
+        year = self._state.year
+        month_label = EN_MONTHS[month - 1]
+
+        existing = getattr(self, "_month_mapping_win", None)
+        if existing is not None and existing.winfo_exists():
+            existing.destroy()
+
+        win = tk.Toplevel(self)
+        win.title(f"Month mapping — {month_label} {year}")
+        win.transient(self.winfo_toplevel())
+        win.geometry("920x420")
+        win.minsize(760, 280)
+        self._month_mapping_win = win
+
+        ttk.Label(
+            win,
+            text=(
+                f"Import mappings for {month_label} {year}. Shows each merchant "
+                "with activity in this month, its amount, and any saved rule or "
+                "in-progress assignment from the temporary-category step. "
+                "Use Manage mappings to edit rules."
+            ),
+            wraplength=880,
+            justify="left",
+        ).pack(fill=tk.X, padx=12, pady=(12, 8))
+
+        rows = self._repo.list_month_merchant_mappings(project.id, year, month)
+
+        table_wrap = ttk.Frame(win)
+        table_wrap.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+        cols = ("merchant", "amount", "type", "final", "scope")
+        tree = ttk.Treeview(
+            table_wrap, columns=cols, show="headings", height=min(12, max(4, len(rows)))
+        )
+        tree.heading("merchant", text="Temporary category")
+        tree.heading("amount", text="Amount")
+        tree.heading("type", text="Type")
+        tree.heading("final", text="Final category")
+        tree.heading("scope", text="Mapping")
+        tree.column("merchant", width=260, anchor="w", stretch=True)
+        tree.column("amount", width=100, anchor="center", stretch=False)
+        tree.column("type", width=110, anchor="center", stretch=False)
+        tree.column("final", width=180, anchor="center", stretch=True)
+        tree.column("scope", width=110, anchor="center", stretch=False)
+
+        if not rows:
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    f"No import merchants for {month_label} {year}.",
+                    "",
+                    "",
+                    "",
+                    "",
+                ),
+            )
+        else:
+            for row in rows:
+                type_lbl = self._kind_to_type_label(row["type_kind"])
+                if type_lbl == self._ASSIGN_TYPE_UNSET:
+                    type_lbl = "—"
+                tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        row["display_name"],
+                        _money_from_cents(row["amount_cents"]),
+                        type_lbl,
+                        row["final_name"],
+                        row["scope_label"],
+                    ),
+                )
+
+        scroll = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ttk.Button(
+            btns, text="Manage mappings", command=self._open_manage_mappings_window
+        ).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+
+        def _on_close() -> None:
+            win.destroy()
+            self._month_mapping_win = None
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
 
     # ----- Manage saved merchant mappings --------------------------------
     # Column layout for the editable mappings grid (data cols 0/2/4/6/8; the

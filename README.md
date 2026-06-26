@@ -80,13 +80,13 @@ Instead of typing every transaction by hand, you can import a bank-statement CSV
 - **Import CSV…** — opens a file picker for a `.csv` file.
 - **Drop .CSV file here** — drag a `.csv` straight from File Explorer onto this zone. *(Drag-and-drop needs the optional `tkinterdnd2` package — see Quick start. Without it you still get the button.)*
 - **Undo last import** — sits to the right of the drop zone; reverses the most recent import for the current project (see *Duplicate-import safeguards* below). Disabled when there's nothing to undo.
-- **Manage mappings…** — top-right corner of the Add Entry box; opens the saved-rules editor (see *Managing saved rules* below).
+- **Manage mappings** — top-right corner of the Add Entry box; opens the saved-rules editor (see *Managing saved rules* below).
 
 **What happens on import:**
 
 1. **Format detection.** The first time you import a given bank's export, the app auto-detects the layout (which columns hold the date / description / amount, whether there's a header row, the date format, and whether amounts are one signed column or separate debit/credit columns) and shows a **Set up bank CSV format** dialog with a live preview. Confirm or correct it, give it a name, and import.
 2. **Remembered formats.** That layout is saved as a *format profile* keyed by the file's structure, so the next CSV from the same bank imports in one click — no dialog.
-3. **Rows land in the right month/year.** Every transaction is placed into the correct month and year cell based on its date (the *Value Date* inside the description if present, otherwise the row's leading date). A statement spanning multiple months/years is split correctly.
+3. **Rows land in the right month/year.** Every transaction is placed into the correct month and year cell based on its date (the *Value Date* inside the description if present, otherwise the row's leading date). A statement spanning multiple months/years is split correctly. For categories touched by the import, if the **currently selected month** (the Month dropdown) has no imported row, that cell is filled in as **$0.00**.
 4. **Merchants become temporary categories.** Each distinct merchant gets its own column, flagged with a **light-red header** so you can tell it apart. Until you assign it, a temporary category is **excluded from every total, breakdown, and chart** (Total Income/Expenses, Net, Investments, Start/End of Month) — it only shows in the editable grid.
 5. **A notice appears** in the Add Entry box: *"Please assign temporary categories"* with an **Assign now** button.
 
@@ -96,6 +96,8 @@ A table lists every unassigned merchant. For each one you choose:
 
 | Column | What it does |
 |---|---|
+| **Temporary category** | The merchant name from the CSV (transfers keep the full description). |
+| **Amount** | The total imported value for that merchant (signed, as on the statement). |
 | **Type** | `Expense`, `Income`, `Investment`, `Discrepancy`, or `Transfer`. Drives the sign rules exactly like a normal category (see *How values & signs work*). |
 | **Final category name** | A dropdown of your existing and saved category names — pick one to fold the merchant into it. Choose **Other (type a new name)** at the top of the list to switch the box to free text and create a brand-new category (use the ▾ button to switch back to the dropdown). |
 | **Mapping** | `Per-Project` (remembered only in this project) or `Global` (remembered across all projects). |
@@ -103,7 +105,7 @@ A table lists every unassigned merchant. For each one you choose:
 - **Merging:** several merchants given the **same name + type** merge into a single column, with their values summed — exactly like the manual grid.
 - **Transfer type:** money moved between your own accounts. Assigning a merchant to **Transfer** removes its column from the grid entirely (it's neither income nor expense). Transfer-style rows keep their *full* description as the temporary name (not shortened) so you can tell which transfer is which.
 - **Remembered rules:** once assigned, the same merchant in a future CSV auto-assigns straight to its final category — no temporary step. `Global` rules apply in every project; `Per-Project` rules only in the project you saved them in.
-- **Managing saved rules:** click **Manage mappings…** (top-right of the Add Entry box) to see every saved merchant rule. You can edit each rule's **Type**, **Final category** (the same dropdown of existing names, with **Other** to type a new one), and **Mapping** scope inline, then click **Save** (switching a rule to *Per-Project* applies it to the project you're viewing). Or click **Delete** on a row to forget it — that merchant will become a temporary category again on the next import. Editing or deleting a rule does **not** touch amounts already imported into your categories.
+- **Managing saved rules:** click **Manage mappings** (top-right of the Add Entry box) to see every saved merchant rule. You can edit each rule's **Type**, **Final category** (the same dropdown of existing names, with **Other** to type a new one), and **Mapping** scope inline, then click **Save** (switching a rule to *Per-Project* applies it to the project you're viewing). Or click **Delete** on a row to forget it — that merchant will become a temporary category again on the next import. Editing or deleting a rule does **not** touch amounts already imported into your categories.
 - **Partial saves:** click **Save** and any fully-filled rows are assigned immediately. The window closes either way. Rows missing a Type, Mapping, or name stay temporary, and your in-progress selections are saved as a draft so they're restored when you reopen the window via **Assign now**.
 
 **Duplicate-import safeguards:**
@@ -121,7 +123,7 @@ The app remembers every transaction it has imported into a project, so importing
 #### Month Summary
 
 - A **Month** dropdown that scopes this section. Pick a single month, or **All** to aggregate every month of the currently-selected year.
-- Six live totals at the top section:
+- Six live totals at the top section (Income → Expenses → Net → Investments → Start of Month → End of Month):
   - **Total Expenses** (red) — sum of Expense-kind cents across the selected months, **plus the magnitude of any Investment-kind cells whose value is negative** (i.e. investment losses count as money out). Positive investments (gains) are not included here.
   - **Total Income** (green) — sum of Income-kind cents across the selected months.
   - **Net** (green if ≥ 0, red if < 0) — `Total Income − Total Expenses` for the selected months only. Because investment **losses** are folded into Total Expenses, they pull Net down; investment **gains** stay out of Net entirely (they only show up in End of Month).
@@ -135,6 +137,7 @@ The app remembers every transaction it has imported into a project, so importing
 
   Example: in January 2025 you record `+$500` of income and a `+$200` Investment gain. With **Month** set to **January 2025**, **Start of Month** reads `$0.00` (nothing before Jan 1), **Investments** reads `$200.00`, and **End of Month** reads `$700.00`. Switch to **February 2025** (no new entries) — Start of Month becomes `$700.00` (you walked in with January's closing balance), End of Month stays `$700.00`. Switch to **All 2025** — Start of Month wraps back to `$0.00` (Dec 31 2024), End of Month stays `$700.00`. If in March 2026 you record a `-$50` Investment loss and view **March 2026**, Start of Month is `$700.00` (Feb 28 2026 closing), End of Month is `$650.00`.
 
+- **Manage Month Mapping** — sits immediately to the right of **End of Month** in the totals strip (not on the far right of the section). Opens a read-only table of every import merchant with activity in the **single month** selected in the Month Summary dropdown (pick a specific month, not All). Shows the temporary category name, that month's amount, Type, final category, and Mapping scope (saved rule or in-progress assignment). Use **Manage mappings** inside that window to edit rules.
 - The **editable 12-row grid** — one row per month, one column per category. This is where you do most of your data entry.
 
 > **Note:** The Month dropdown also drives the **Month Breakdown** section below — its per-category totals follow the same single-month / "All" choice you make here.
@@ -342,7 +345,8 @@ To swap in your own logo:
 - Wheel scrolling is tuned to feel browser-like: pixel-precise canvas (`yscrollincrement=1`), capped per-event delta, proportional steps inside Treeviews, and a paint-flush gate that only fires during fast wheel bursts (see `_WheelScrollPaintGate` in `widgets.py`). Shift+wheel inside a wide table scrolls horizontally at roughly 3× the per-tick column step of vertical wheel.
 - **Cell navigation & undo/redo:** the Month-grid editor is a custom `TreeviewCellEditor` in `widgets.py` that intercepts `KeyPress-Tab` / `KeyPress-Shift-Tab` / `KeyPress-Return` to override Tk's default focus traversal, calls `tree.see(...)` + retries `tree.bbox(...)` so an off-screen target cell still gets a valid Entry overlay, and reports back via an `on_navigate(direction)` callback. Undo/redo is two stacks of `(item_id, col_id, old_cents, new_cents)` snapshots maintained by `main_window.py` and bound globally to `Ctrl+Z` / `Ctrl+Y`.
 - **CSV import** lives in `finance_app/csv_import.py`: a `ColumnMapping` dataclass plus `read_raw_rows` → `detect_mapping` (heuristic auto-detect of date/description/amount columns, header, date format, signed vs debit/credit) → `parse_with_mapping`, with `file_signature` fingerprinting a layout so the same bank is recognised next time. Merchant keys are the first 1–3 description words (transfers keep the full description); `group_by_merchant` sums cents per `(year, month)`.
-- **Import persistence** adds five tables in `repository.py`: `csv_format_profiles` (signature → saved `ColumnMapping`), `merchant_rules` (remembered merchant → category mappings, `project`- or `global`-scoped), `merchant_drafts` (in-progress Assign-window selections), `import_batches` (one row per import run, so an import can be undone as a unit), and `imported_transactions` (a per-project ledger of every imported transaction, keyed by a date+amount+description fingerprint, used to skip duplicates on re-import and to reverse a batch). Categories carry `is_temporary` / `merchant_key` flags; all aggregate queries filter out `is_temporary` rows so unassigned merchants never hit a total or chart.
+- **Import persistence** adds six tables in `repository.py`: `csv_format_profiles` (signature → saved `ColumnMapping`), `merchant_rules` (remembered merchant → category mappings, `project`- or `global`-scoped), `merchant_drafts` (in-progress Assign-window selections), `import_batches` (one row per import run, so an import can be undone as a unit), `imported_transactions` (a per-project ledger of every imported transaction, keyed by a date+amount+description fingerprint and storing `merchant_key` / `merchant_display` for month reports, used to skip duplicates on re-import and to reverse a batch), and `import_zero_fills` (tracks $0 padding cells written into the currently-viewed month during import so undo can remove them). Categories carry `is_temporary` / `merchant_key` flags; all aggregate queries filter out `is_temporary` rows so unassigned merchants never hit a total or chart.
+- **Manage Month Mapping** — `_open_manage_month_mapping_window` requires a single month via `_summary_scope_month()` (not All) and calls `list_month_merchant_mappings`, which groups `imported_transactions` by `merchant_key` for that `(year, month)` then enriches each row via `_merchant_mapping_labels` (saved rule → draft → temporary fallback).
 ---
 
 ## Troubleshooting
@@ -364,4 +368,5 @@ To swap in your own logo:
 | An import column vanished after assigning it | You set its **Type** to **Transfer** — transfers are money moved between your own accounts, so the column is removed from the grid by design. |
 | I imported the same file twice but values didn't double | Expected — the app remembers imported transactions and skips duplicates. The confirmation dialog shows how many were new vs already-imported. |
 | **Undo last import** didn't fully reverse an import | Merchants you'd already assigned to a real category since importing can't be reversed (their amounts moved into the assigned column). Undo right after importing, before assigning, for a clean rollback. |
+| **Manage Month Mapping** asks me to pick a month | Pick a specific month in the Month Summary dropdown (not **All**). The window is scoped to one month at a time. |
 | Want to start fresh | Close the app, delete `%LOCALAPPDATA%\FinanceApp\finance.db`, relaunch. (Make a backup first if you might want it back.) |

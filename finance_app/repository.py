@@ -185,12 +185,27 @@ class FinanceRepository:
           year INTEGER NOT NULL,
           month INTEGER NOT NULL,
           contribution_cents INTEGER NOT NULL DEFAULT 0,
+          merchant_key TEXT,
+          merchant_display TEXT,
           UNIQUE(project_id, fingerprint),
           FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
           FOREIGN KEY (batch_id) REFERENCES import_batches(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_imported_txn_project ON imported_transactions(project_id);
         CREATE INDEX IF NOT EXISTS idx_imported_txn_batch ON imported_transactions(batch_id);
+
+        -- Months explicitly padded to $0 during an import (no CSV row for that
+        -- month). Tracked per batch so undo can remove the padding.
+        CREATE TABLE IF NOT EXISTS import_zero_fills (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          batch_id INTEGER NOT NULL,
+          category_id INTEGER NOT NULL,
+          year INTEGER NOT NULL,
+          month INTEGER NOT NULL,
+          FOREIGN KEY (batch_id) REFERENCES import_batches(id) ON DELETE CASCADE,
+          FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_import_zero_fills_batch ON import_zero_fills(batch_id);
         """
         with self._conn:
             self._conn.executescript(schema)
@@ -206,6 +221,37 @@ class FinanceRepository:
         if "merchant_key" not in cat_cols0:
             with self._conn:
                 self._conn.execute("ALTER TABLE categories ADD COLUMN merchant_key TEXT;")
+
+        imp_cols = {
+            row["name"].lower()
+            for row in self._conn.execute("PRAGMA table_info(imported_transactions);")
+        }
+        if "merchant_key" not in imp_cols:
+            with self._conn:
+                self._conn.execute(
+                    "ALTER TABLE imported_transactions ADD COLUMN merchant_key TEXT;"
+                )
+        if "merchant_display" not in imp_cols:
+            with self._conn:
+                self._conn.execute(
+                    "ALTER TABLE imported_transactions ADD COLUMN merchant_display TEXT;"
+                )
+            # Backfill merchant labels from the category each row landed in.
+            with self._conn:
+                self._conn.execute(
+                    """
+                    UPDATE imported_transactions
+                    SET merchant_key = (
+                            SELECT merchant_key FROM categories
+                            WHERE categories.id = imported_transactions.category_id
+                        ),
+                        merchant_display = (
+                            SELECT name FROM categories
+                            WHERE categories.id = imported_transactions.category_id
+                        )
+                    WHERE merchant_key IS NULL AND category_id IS NOT NULL;
+                    """
+                )
 
         cols = {row["name"].lower() for row in self._conn.execute("PRAGMA table_info(projects);")}
         if "is_favorite" not in cols:
@@ -1072,20 +1118,130 @@ class FinanceRepository:
             )
 
     # ----- Temp-category listing & assignment ----------------------------
-    def list_temp_merchants(self, project_id: int) -> list[tuple[str, str]]:
-        """Distinct ``(merchant_key, display_name)`` for every temporary
-        category in this project (collapsed across years)."""
+    def list_temp_merchants(self, project_id: int) -> list[tuple[str, str, int]]:
+        """Distinct temporary merchants: ``(merchant_key, display_name,
+        total_signed_cents)``. ``total_signed_cents`` is the sum of every
+        imported cell for that merchant across all years/months."""
         rows = self._conn.execute(
             """
-            SELECT merchant_key, name, MIN(year) AS y
-            FROM categories
-            WHERE project_id = ? AND is_temporary = 1 AND merchant_key IS NOT NULL
-            GROUP BY merchant_key
-            ORDER BY LOWER(name);
+            SELECT c.merchant_key, MIN(c.name) AS name,
+                   COALESCE(SUM(ma.amount_cents), 0) AS total_cents
+            FROM categories c
+            LEFT JOIN monthly_amounts ma ON ma.category_id = c.id
+            WHERE c.project_id = ? AND c.is_temporary = 1 AND c.merchant_key IS NOT NULL
+            GROUP BY c.merchant_key
+            ORDER BY LOWER(MIN(c.name));
             """,
             (project_id,),
         ).fetchall()
-        return [(str(r["merchant_key"]), str(r["name"])) for r in rows]
+        return [
+            (str(r["merchant_key"]), str(r["name"]), int(r["total_cents"])) for r in rows
+        ]
+
+    # ----- Month mapping view (import ledger) ----------------------------
+    # Read-only data for the Manage Month Mapping window. Aggregates
+    # ``imported_transactions`` by merchant_key so merchants stay listed
+    # after their temp column is assigned or merged into a real category.
+
+    def _merchant_mapping_labels(
+        self, project_id: int, merchant_key: str, fallback_kind: Optional[int] = None
+    ) -> tuple[Optional[int], str, str]:
+        """Resolve Type / final category / Mapping labels for a merchant."""
+        rule = self.get_merchant_rule(project_id, merchant_key)
+        draft = self.get_merchant_draft(project_id, merchant_key)
+        if rule is not None:
+            kind, final_name, scope = rule
+            scope_label = "Global" if scope == "global" else "Per-Project"
+            return kind, final_name, scope_label
+        if draft is not None:
+            draft_kind, draft_name, draft_scope = draft
+            type_kind = draft_kind if draft_kind is not None else fallback_kind
+            final = (draft_name or "").strip() or "(not set)"
+            if draft_scope == "global":
+                scope_label = "Global"
+            elif draft_scope == "project":
+                scope_label = "Per-Project"
+            else:
+                scope_label = "—"
+            return type_kind, final, scope_label
+        if fallback_kind is not None:
+            return fallback_kind, "(temporary)", "—"
+        return None, "(unassigned)", "—"
+
+    def list_month_merchant_mappings(
+        self, project_id: int, year: int, month: int
+    ) -> list[dict]:
+        """Merchants with CSV import activity in a given month, using the
+        import ledger so rows stay visible after assignment."""
+        by_key: dict[str, dict] = {}
+
+        ledger_rows = self._conn.execute(
+            """
+            SELECT merchant_key, merchant_display,
+                   SUM(contribution_cents) AS amount_cents
+            FROM imported_transactions
+            WHERE project_id = ? AND year = ? AND month = ?
+              AND merchant_key IS NOT NULL
+            GROUP BY merchant_key
+            ORDER BY LOWER(merchant_display);
+            """,
+            (project_id, year, month),
+        ).fetchall()
+        for r in ledger_rows:
+            key = str(r["merchant_key"])
+            by_key[key] = {
+                "merchant_key": key,
+                "display_name": str(r["merchant_display"] or key),
+                "amount_cents": int(r["amount_cents"]),
+                "fallback_kind": None,
+                "is_temporary": False,
+            }
+
+        # Still-temporary columns with amounts but no ledger row (edge case).
+        temp_rows = self._conn.execute(
+            """
+            SELECT c.merchant_key, c.name, c.kind, c.is_temporary,
+                   ma.amount_cents
+            FROM categories c
+            INNER JOIN monthly_amounts ma ON ma.category_id = c.id
+            WHERE c.project_id = ? AND ma.year = ? AND ma.month = ?
+              AND c.merchant_key IS NOT NULL
+            ORDER BY LOWER(c.name);
+            """,
+            (project_id, year, month),
+        ).fetchall()
+        for r in temp_rows:
+            key = str(r["merchant_key"])
+            if key in by_key:
+                continue
+            by_key[key] = {
+                "merchant_key": key,
+                "display_name": str(r["name"]),
+                "amount_cents": int(r["amount_cents"]),
+                "fallback_kind": int(r["kind"]),
+                "is_temporary": int(r["is_temporary"]) != 0,
+            }
+
+        out: list[dict] = []
+        for key in sorted(by_key.keys(), key=lambda k: by_key[k]["display_name"].lower()):
+            item = by_key[key]
+            type_kind, final, scope_label = self._merchant_mapping_labels(
+                project_id, key, item.get("fallback_kind")
+            )
+            if item.get("is_temporary") and final == "(unassigned)":
+                final = "(temporary)"
+            out.append(
+                {
+                    "merchant_key": key,
+                    "display_name": item["display_name"],
+                    "amount_cents": item["amount_cents"],
+                    "type_kind": type_kind,
+                    "final_name": final,
+                    "scope_label": scope_label,
+                    "is_temporary": item.get("is_temporary", False),
+                }
+            )
+        return out
 
     def has_temp_categories(self, project_id: int) -> bool:
         row = self._conn.execute(
@@ -1132,6 +1288,16 @@ class FinanceRepository:
                     project_id, target_id, year, int(am["month"]), int(am["amount_cents"])
                 )
             with self._conn:
+                # Keep import-ledger rows tied to this merchant after the temp
+                # column is removed.
+                self._conn.execute(
+                    """
+                    UPDATE imported_transactions
+                    SET category_id = ?
+                    WHERE project_id = ? AND category_id = ?;
+                    """,
+                    (target_id, project_id, temp_id),
+                )
                 self._conn.execute("DELETE FROM categories WHERE id = ?;", (temp_id,))
 
         self.delete_merchant_draft(project_id, merchant_key)
@@ -1207,29 +1373,99 @@ class FinanceRepository:
         month: int,
         signed_cents: int,
         fingerprint: str,
-    ) -> None:
+        merchant_key: Optional[str] = None,
+        merchant_display: Optional[str] = None,
+    ) -> bool:
         """Add one transaction's amount to its target cell and record it in the
-        ledger (so it won't be re-imported) under the given batch."""
+        ledger (so it won't be re-imported) under the given batch. Returns
+        True when the row was newly recorded, False when it was already
+        imported (no amount change)."""
+        if self._conn.execute(
+            """
+            SELECT 1 FROM imported_transactions
+            WHERE project_id = ? AND fingerprint = ?;
+            """,
+            (project_id, fingerprint),
+        ).fetchone():
+            return False
         kind_row = self._conn.execute(
             "SELECT kind, is_temporary FROM categories WHERE id = ?;", (category_id,)
         ).fetchone()
         if not kind_row:
-            return
+            return False
         kind = int(kind_row["kind"])
         is_temp = int(kind_row["is_temporary"]) != 0
         contribution = self._kind_signed_contribution(kind, is_temp, signed_cents)
         existing = self.get_monthly_amount_cents(category_id, year, month) or 0
         with self._conn:
-            self._raw_set_amount(project_id, category_id, year, month, existing + contribution)
-            self._conn.execute(
+            cur = self._conn.execute(
                 """
                 INSERT INTO imported_transactions
-                    (project_id, batch_id, fingerprint, category_id, year, month, contribution_cents)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (project_id, batch_id, fingerprint, category_id, year, month,
+                     contribution_cents, merchant_key, merchant_display)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, fingerprint) DO NOTHING;
                 """,
-                (project_id, batch_id, fingerprint, category_id, year, month, contribution),
+                (
+                    project_id,
+                    batch_id,
+                    fingerprint,
+                    category_id,
+                    year,
+                    month,
+                    contribution,
+                    merchant_key,
+                    merchant_display,
+                ),
             )
+            # Record the ledger row first; only add to the cell when the insert
+            # succeeded so a duplicate can never double-count.
+            if cur.rowcount == 0:
+                return False
+            self._raw_set_amount(
+                project_id, category_id, year, month, existing + contribution
+            )
+        return True
+
+    def zero_fill_import_category_month(
+        self,
+        project_id: int,
+        category_id: int,
+        year: int,
+        month: int,
+        batch_id: int,
+    ) -> bool:
+        """Insert $0 into ``(year, month)`` when that cell has no value yet,
+        and record it on ``batch_id`` so undo can remove the padding. Returns
+        True if a zero was inserted."""
+        if month < 1 or month > 12:
+            return False
+        with self._conn:
+            exists = self._conn.execute(
+                """
+                SELECT 1 FROM monthly_amounts
+                WHERE category_id = ? AND year = ? AND month = ?;
+                """,
+                (category_id, year, month),
+            ).fetchone()
+            if exists is not None:
+                return False
+            self._conn.execute(
+                """
+                INSERT INTO monthly_amounts
+                    (project_id, category_id, year, month, amount_cents)
+                VALUES (?, ?, ?, ?, 0);
+                """,
+                (project_id, category_id, year, month),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO import_zero_fills (batch_id, category_id, year, month)
+                VALUES (?, ?, ?, ?);
+                """,
+                (batch_id, category_id, year, month),
+            )
+        return True
 
     def last_import_batch_id(self, project_id: int) -> Optional[int]:
         """The most recent import batch for a project, or None if none exist."""
@@ -1278,6 +1514,26 @@ class FinanceRepository:
                     touched_temp.add(cat_id)
                 reversed_count += 1
 
+            # Remove $0 padding cells this batch added for months with no CSV row.
+            for zr in self._conn.execute(
+                """
+                SELECT category_id, year, month FROM import_zero_fills
+                WHERE batch_id = ?;
+                """,
+                (batch_id,),
+            ).fetchall():
+                cat_id = int(zr["category_id"])
+                year = int(zr["year"])
+                month = int(zr["month"])
+                self._conn.execute(
+                    """
+                    DELETE FROM monthly_amounts
+                    WHERE category_id = ? AND year = ? AND month = ?
+                      AND amount_cents = 0;
+                    """,
+                    (cat_id, year, month),
+                )
+
             # Remove temporary columns the import created that are now empty.
             for cat_id in touched_temp:
                 left = self._conn.execute(
@@ -1290,6 +1546,9 @@ class FinanceRepository:
             self._conn.execute(
                 "DELETE FROM imported_transactions WHERE project_id = ? AND batch_id = ?;",
                 (project_id, batch_id),
+            )
+            self._conn.execute(
+                "DELETE FROM import_zero_fills WHERE batch_id = ?;", (batch_id,)
             )
             self._conn.execute("DELETE FROM import_batches WHERE id = ?;", (batch_id,))
         return reversed_count
