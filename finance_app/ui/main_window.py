@@ -274,7 +274,7 @@ class MainWindow(ttk.Frame):
     # =====================================================================
     # Project picker: a "Create New Project" entry, two listboxes
     # (Favourites & Recents), and the DB path + Backup button at the
-    # bottom. Right-click on a project gives Favourite/Delete actions.
+    # bottom. Right-click on a project gives Favourite / Rename / Delete.
     def _build_home(self, parent: ttk.Frame) -> ttk.Frame:
         frame = ttk.Frame(parent)
 
@@ -403,9 +403,48 @@ class MainWindow(ttk.Frame):
             label=fav_label,
             command=lambda: (self._repo.set_project_favorite(project.id, not project.is_favorite), self._reload_projects()),
         )
+        menu.add_command(label="Rename", command=lambda: self._prompt_rename_project(project))
         menu.add_separator()
         menu.add_command(label="Delete", command=lambda: self._delete_project(project))
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _prompt_rename_project(self, project: Project) -> None:
+        new_name = simpledialog.askstring(
+            "Rename project",
+            f"New name for “{project.name}”:",
+            initialvalue=project.name,
+            parent=self,
+        )
+        if new_name is None:
+            return
+        self._apply_project_rename(project, new_name)
+
+    def _apply_project_rename(self, project: Project, new_name: str) -> None:
+        """Persist a new project name and refresh any UI that shows it."""
+        new_name = new_name.strip()
+        if not new_name or new_name == project.name:
+            return
+        try:
+            self._repo.rename_project(project.id, new_name)
+        except ValueError:
+            messagebox.showwarning(
+                title="Rename project",
+                message="Project name cannot be empty.",
+            )
+            return
+        updated = next(
+            (p for p in self._repo.list_projects() if p.id == project.id), None
+        )
+        if updated is None:
+            return
+        if self._state.selected_project and self._state.selected_project.id == project.id:
+            self._state.selected_project = updated
+            if hasattr(self, "_project_title"):
+                self._project_title.config(text=updated.name)
+        self._reload_projects()
+        if hasattr(self, "_charts"):
+            self._charts.reload_project_options()
+            self._charts.refresh_charts()
 
     def _delete_project(self, project: Project) -> None:
         ok = messagebox.askyesno(
@@ -434,8 +473,16 @@ class MainWindow(ttk.Frame):
         header = ttk.Frame(frame)
         header.pack(fill=tk.X, pady=(0, 10))
         ttk.Button(header, text="← Back", command=self._show_home).pack(side=tk.LEFT)
-        self._project_title = ttk.Label(header, text="", font=("Segoe UI", 16, "bold"))
-        self._project_title.pack(side=tk.LEFT, padx=(12, 0))
+        self._project_title_font = ("Segoe UI", 16, "bold")
+        self._project_title_wrap = ttk.Frame(header)
+        self._project_title_wrap.pack(side=tk.LEFT, padx=(12, 0))
+        self._project_title_var = tk.StringVar()
+        self._project_title_entry: Optional[tk.Entry] = None
+        self._project_title = ttk.Label(
+            self._project_title_wrap, text="", font=self._project_title_font, cursor="xterm"
+        )
+        self._project_title.pack()
+        self._project_title.bind("<Button-1>", self._start_project_title_edit, add=True)
 
         picker = ttk.Frame(header)
         picker.pack(side=tk.RIGHT)
@@ -1093,6 +1140,58 @@ class MainWindow(ttk.Frame):
 
         # focus category name for fast entry like Avalonia version
         self.after(10, lambda: self.focus_force() or None)
+
+    def _start_project_title_edit(self, _event: Optional[tk.Event] = None) -> None:
+        """Click the header title to rename the open project inline."""
+        if self._project_title_entry is not None:
+            return
+        project = self._state.selected_project
+        if not project:
+            return
+        self._project_title.pack_forget()
+        self._project_title_var.set(project.name)
+        width = max(12, len(project.name) + 2)
+        entry = tk.Entry(
+            self._project_title_wrap,
+            textvariable=self._project_title_var,
+            font=self._project_title_font,
+            width=width,
+            justify="left",
+        )
+        entry.pack()
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+        entry.bind("<Return>", self._commit_project_title_edit, add=True)
+        entry.bind("<Escape>", self._cancel_project_title_edit, add=True)
+        entry.bind("<FocusOut>", self._commit_project_title_edit, add=True)
+        self._project_title_entry = entry
+
+    def _commit_project_title_edit(self, _event: Optional[tk.Event] = None) -> str:
+        entry = self._project_title_entry
+        if entry is None:
+            return "break"
+        project = self._state.selected_project
+        new_name = self._project_title_var.get().strip()
+        self._project_title_entry = None
+        entry.destroy()
+        self._project_title.pack()
+        if project and new_name and new_name != project.name:
+            self._apply_project_rename(project, new_name)
+        elif project:
+            self._project_title.config(text=project.name)
+        return "break"
+
+    def _cancel_project_title_edit(self, _event: Optional[tk.Event] = None) -> str:
+        entry = self._project_title_entry
+        if entry is None:
+            return "break"
+        project = self._state.selected_project
+        self._project_title_entry = None
+        entry.destroy()
+        self._project_title.pack()
+        if project:
+            self._project_title.config(text=project.name)
+        return "break"
 
     def _on_year_month_changed(self) -> None:
         if not self._state.selected_project:

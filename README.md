@@ -37,6 +37,7 @@ When you launch the app you land on the **Home** screen.
 | **Create a project** | Type a name into the box at the top, click **Create Project** (or press Enter). |
 | **Open a project** | Double-click it in **Favourites** or **Recents**. |
 | **Favourite / Unfavourite a project** | Right-click it → choose **Favourite** / **Unfavourite**. |
+| **Rename a project** | Right-click it → **Rename**, or click the project title in the header once a project is open (see *Project view* below). |
 | **Delete a project** | Right-click it → **Delete**. Confirmation dialog. *Cannot be undone.* |
 | **Backup the database** | Click **Backup database** (bottom-right). Creates a timestamped `finance.backup-YYYYMMDD-HHMMSS.db` next to your live database. |
 
@@ -47,7 +48,7 @@ The **DB:** label shows where your database file lives. Recents are sorted by mo
 Opening a project takes you to the main screen. The top header has:
 
 - **← Back** — return to Home.
-- **Project title** — the project's name.
+- **Project title** — the project's name. Click it to rename inline (type the new name, press Enter to save or Esc to cancel). The same rename is available from the Home screen via right-click → **Rename**.
 - **Year** and **Month** dropdowns — drive every section below.
 
 Underneath that is the **Add Entry** box, then a vertically-scrollable column of collapsible sections (click the chevron / title to expand or collapse).
@@ -341,6 +342,7 @@ To swap in your own logo:
 - Python 3.9+ • Tkinter (built into Python on Windows) • SQLite (built into Python) • matplotlib for charts • tkinterdnd2 (optional) for file drag-and-drop.
 - Money is stored as integer cents in SQLite; formatted on display only.
 - All data access goes through `finance_app/repository.py`.
+- **Project rename** — `rename_project` in `repository.py` updates the `projects.name` row. The Home screen calls `_prompt_rename_project` from the list context menu; the project header swaps the title label for an inline `Entry` via `_start_project_title_edit` / `_commit_project_title_edit`. Both paths funnel through `_apply_project_rename`, which refreshes Favourites/Recents, the open project's `UiState`, and chart project selectors.
 - The UI is split into `finance_app/ui/main_window.py` (views & app glue), `widgets.py` (reusable Tk widgets), and `charts.py` (matplotlib panels).
 - Wheel scrolling is tuned to feel browser-like: pixel-precise canvas (`yscrollincrement=1`), capped per-event delta, proportional steps inside Treeviews, and a paint-flush gate that only fires during fast wheel bursts (see `_WheelScrollPaintGate` in `widgets.py`). Shift+wheel inside a wide table scrolls horizontally at roughly 3× the per-tick column step of vertical wheel.
 - **Cell navigation & undo/redo:** the Month-grid editor is a custom `TreeviewCellEditor` in `widgets.py` that intercepts `KeyPress-Tab` / `KeyPress-Shift-Tab` / `KeyPress-Return` to override Tk's default focus traversal, calls `tree.see(...)` + retries `tree.bbox(...)` so an off-screen target cell still gets a valid Entry overlay, and reports back via an `on_navigate(direction)` callback. Undo/redo is two stacks of `(item_id, col_id, old_cents, new_cents)` snapshots maintained by `main_window.py` and bound globally to `Ctrl+Z` / `Ctrl+Y`.

@@ -396,6 +396,17 @@ class FinanceRepository:
                 (1 if is_favorite else 0, project_id),
             )
 
+    def rename_project(self, project_id: int, new_name: str) -> None:
+        """Change a project's display name."""
+        name = new_name.strip()
+        if not name:
+            raise ValueError("project name cannot be empty")
+        with self._conn:
+            self._conn.execute(
+                "UPDATE projects SET name = ? WHERE id = ?;",
+                (name, project_id),
+            )
+
     def touch_project_opened(self, project_id: int) -> None:
         """Stamp ``last_opened_at`` to now so this project floats to the top
         of the Recents list."""
